@@ -1,0 +1,87 @@
+# Instalador Windows de Gentle Dot, construido en CI.
+#
+# Upstream no publica releases y `.github/workflows/windows.yml` sólo compila y testea: no
+# empaqueta. Este workflow agrega el empaquetado (`package:runtime` + `package:windows`) en un
+# runner windows-latest, que es el único lugar con MSVC, Go y Rust ya disponibles.
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['installer/**']
+
+jobs:
+  installer:
+    name: NSIS installer (x64)
+    runs-on: windows-latest
+    env:
+      PNPM_CONFIG_MINIMUM_RELEASE_AGE_EXCLUDE: '["gentle-pi@4.6.0"]'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: false
+      # gentle-pi's Windows postinstall compiles gentle-ai with this, so it must exist before
+      # `pnpm install`, not only before the runtime staging.
+      - name: Expose Go to the install and the runtime staging
+        shell: pwsh
+        run: |
+          $go = (Get-Command go.exe).Source
+          "GENTLE_DOT_BUILD_GO=$go" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          workspaces: apps/desktop/src-tauri
+      - run: pnpm install --frozen-lockfile
+
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      # El runtime empaquetado exige el addon nativo: mismos inputs que windows.yml.
+      - name: Build app-channel addon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = node -p process.version
+          $inputs = Join-Path $env:RUNNER_TEMP 'node-addon-inputs'
+          New-Item -ItemType Directory -Force -Path $inputs | Out-Null
+          $release = "https://nodejs.org/download/release/$version"
+          Invoke-WebRequest "$release/node-$version-headers.tar.gz" -OutFile "$inputs/headers.tar.gz"
+          Invoke-WebRequest "$release/win-x64/node.lib" -OutFile "$inputs/node.lib"
+          $sums = (Invoke-WebRequest "$release/SHASUMS256.txt").Content -split "`n"
+          foreach ($pair in @(@("node-$version-headers.tar.gz", 'headers.tar.gz'), @('win-x64/node.lib', 'node.lib'))) {
+            $line = $sums | Where-Object { $_ -match "^[0-9a-f]{64}\s+$([regex]::Escape($pair[0]))$" }
+            if (-not $line) { throw "No published checksum for $($pair[0])" }
+            $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $inputs $pair[1])).Hash.ToLowerInvariant()
+            if ($actual -ne ($line -split '\s+')[0]) { throw "Checksum mismatch for $($pair[0])" }
+          }
+          tar -xf "$inputs/headers.tar.gz" -C $inputs
+          if ($LASTEXITCODE -ne 0) { throw 'Node header extraction failed' }
+          $compiler = (Get-Command cl.exe).Source
+          pnpm --filter @gentle-dot/daemon run build:windows-stop -- --compiler "$compiler" --headers "$inputs/node-$version/include/node" --node-lib "$inputs/node.lib"
+          if ($LASTEXITCODE -ne 0) { throw 'Native addon build failed' }
+
+      - name: Stage runtime (windows-x64)
+        shell: pwsh
+        run: |
+          pnpm package:runtime --target windows-x64
+          if ($LASTEXITCODE -ne 0) { throw 'runtime staging failed' }
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          pnpm package:windows
+          if ($LASTEXITCODE -ne 0) { throw 'installer build failed' }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gentle-dot-windows-x64-installer
+          path: apps/desktop/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
